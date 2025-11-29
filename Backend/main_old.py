@@ -93,7 +93,7 @@ def init():
 
     model = AutoModelForCausalLM.from_pretrained(
         "microsoft/Phi-3-mini-128k-instruct",
-        device_map="cuda",
+        device_map="cpu",
         torch_dtype="auto",
         trust_remote_code=True,
     )
