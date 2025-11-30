@@ -1,18 +1,23 @@
 """
 agent/rag.py
-Refactored to use google-genai directly (no langchain Google wrapper).
-Requires: google-genai (pip install google-genai)
+Refactored to:
+ - use google-genai directly (no langchain Google wrapper)
+ - optionally run DuckDuckGo web searches when the user asks for links/sources
+ - instruct GenAI to include markdown links when a link request is detected
+
+Requires:
+ - google-genai (pip install google-genai)
+ - duckduckgo_search (optional; pip install duckduckgo_search)
 Set env var: GOOGLE_API_KEY
 """
 
 import os
 import pickle
-from typing import Optional
-
+from typing import Optional, List, Dict, Tuple
 from dotenv import load_dotenv
 load_dotenv()
 
-# faiss + embeddings + docstore
+# FAISS + embeddings + docstore (kept from prior flow)
 import faiss
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -20,28 +25,37 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_core.documents import Document
 
 # Google GenAI client (modern SDK)
-from google import genai
+# If your environment uses "from google import genai" style, keep it; otherwise adjust as needed.
+try:
+    from google import genai  # google-genai package
+except Exception as e:
+    genai = None
+    print(f"[import] google.genai import failed: {e}. Make sure google-genai is installed.")
+
+# DuckDuckGo search (optional). We'll import lazily in search_web to avoid hard dependency.
+# from duckduckgo_search import ddg (used lazily)
 
 # Globals
 KNOWLEDGE_VECTOR_DATABASE: Optional[FAISS] = None
-genai_client: Optional[genai.Client] = None
+genai_client: Optional[object] = None
 EMBEDDING_MODEL = None
 
 
+# -------------------------
+# Initialization
+# -------------------------
 def init_agent(embed_device: str = "cpu"):
     """
     Initialize:
       - HuggingFace embeddings (thenlper/gte-small by default)
       - Load FAISS index + metadata into a FAISS vectorstore wrapper
-      - Initialize Google GenAI client (genai.Client)
+      - Initialize Google GenAI client (genai.Client) if google-genai is available
     """
     global KNOWLEDGE_VECTOR_DATABASE, genai_client, EMBEDDING_MODEL
 
     print("Initializing Agent...")
 
-    # -------------------------
     # Embeddings
-    # -------------------------
     try:
         EMBEDDING_MODEL = HuggingFaceEmbeddings(
             model_name="thenlper/gte-small",
@@ -54,9 +68,7 @@ def init_agent(embed_device: str = "cpu"):
         print(f"[embeddings] Failed to init embeddings: {e}")
         EMBEDDING_MODEL = None
 
-    # -------------------------
     # FAISS index + docstore load
-    # -------------------------
     index_path = "models/faiss_index_LOL.bin"
     metadata_path = "models/faiss_metadata_LOL.pkl"
     if os.path.exists(index_path) and os.path.exists(metadata_path) and EMBEDDING_MODEL is not None:
@@ -94,17 +106,19 @@ def init_agent(embed_device: str = "cpu"):
     else:
         print(f"[faiss] Index/metadata not found at {index_path}/{metadata_path} or embedding not initialized.")
 
-    # -------------------------
     # GenAI client init
-    # -------------------------
     google_api_key = os.getenv("GOOGLE_API_KEY")
     if not google_api_key:
         print("[genai] GOOGLE_API_KEY not set. GenAI client will not be initialized.")
         genai_client = None
         return
 
+    if genai is None:
+        print("[genai] google-genai client not available (import failed). Install google-genai.")
+        genai_client = None
+        return
+
     try:
-        # Initialize client. You can pass api_key or rely on env.
         genai_client = genai.Client(api_key=google_api_key)
         print("[genai] GenAI client initialized.")
     except Exception as e:
@@ -112,6 +126,53 @@ def init_agent(embed_device: str = "cpu"):
         genai_client = None
 
 
+# -------------------------
+# Web search utilities (DuckDuckGo)
+# -------------------------
+def is_link_request(question: str) -> bool:
+    """
+    Basic heuristic: detect if the user asked for links/sources/references.
+    You can expand this to a more robust classifier or regex.
+    """
+    q = question.lower()
+    keywords = ["link", "links", "source", "sources", "reference", "references", "where can i find", "website", "web results", "url"]
+    return any(k in q for k in keywords)
+
+
+def search_web_duckduckgo(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """
+    Use duckduckgo_search.DDGS to fetch search results.
+    Returns list of dicts: {title, href, body}
+    If package not installed or search fails, returns empty list.
+    """
+    try:
+        from duckduckgo_search import DDGS
+    except Exception as e:
+        print(f"[websearch] duckduckgo_search not installed or failed to import: {e}")
+        return []
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            
+        out = []
+        if not results:
+            return out
+        for r in results:
+            out.append({
+                "title": r.get("title", "")[:180],
+                "href": r.get("href", ""),
+                "snippet": r.get("body", "")[:400]
+            })
+        return out
+    except Exception as e:
+        print(f"[websearch] DuckDuckGo query failed: {e}")
+        return []
+
+
+# -------------------------
+# RAG retrieval
+# -------------------------
 def retrieve_context(query: str, k: int = 3, score_threshold: float = 0.70) -> str:
     """
     Do a similarity search on FAISS and return concatenated context.
@@ -134,119 +195,164 @@ def retrieve_context(query: str, k: int = 3, score_threshold: float = 0.70) -> s
     context_parts = []
     for item in retrieved:
         try:
-            # handle (Document, score) vs Document only
             if isinstance(item, (list, tuple)):
                 doc, score = item[0], item[1]
             else:
                 doc, score = item, None
 
-            # If scores are distances or similarities, you may need to invert/adjust threshold logic.
+            # NOTE: check whether score is similarity (higher better) or distance (lower better) in your setup.
             if score is not None and (score < score_threshold):
-                # skip low-score (assumes higher is better). Adjust if your scores are distances.
                 continue
 
             context_parts.append(doc.page_content)
         except Exception as e:
             print(f"[retrieve_context] Error processing retrieved item: {e}")
 
-    # join with newlines; consider truncation later
     return "\n\n".join(context_parts)
 
 
+# -------------------------
+# GenAI response parsing
+# -------------------------
 def _extract_text_from_genai_response(resp) -> str:
     """
     Robustly extract text from various genai response shapes.
-    The google-genai responses often expose .text, or .result / .candidates, etc.
     """
     if resp is None:
         return ""
 
-    # prefer .text if present
     try:
         if hasattr(resp, "text") and resp.text:
             return resp.text
     except Exception:
         pass
 
-    # newer client samples show resp.result[0].content[0].text
     try:
-        # resp.result may be a sequence of output objects
         if hasattr(resp, "result"):
-            # some SDK responses are typed; try common nesting patterns
             r = resp.result
             if isinstance(r, (list, tuple)) and len(r) > 0:
-                # try to find text inside first result
                 first = r[0]
-                # some wrappers: first.output[0].content[0].text or first.content[0].text
+                # common patterns
                 for attr in ("output", "content", "candidates"):
                     if hasattr(first, attr):
                         candidate = getattr(first, attr)
                         if isinstance(candidate, (list, tuple)) and len(candidate) > 0:
                             c0 = candidate[0]
-                            # common field names:
                             for f in ("text", "content"):
                                 if hasattr(c0, f):
                                     return getattr(c0, f)
-                # fallback to string
                 return str(first)
     except Exception:
         pass
 
-    # fallback to stringifying whole response
     try:
         return str(resp)
     except Exception:
         return ""
 
 
-def generate_response(question: str, context: Optional[str], model: str = "gemini-2.5-pro"):
+# -------------------------
+# Prompt building & generation
+# -------------------------
+def _build_prompt(question: str, context: Optional[str], web_results: Optional[List[Dict[str, str]]], require_links: bool) -> str:
     """
-    Build a prompt using the context and question and call GenAI directly.
-    Returns the model's text output (string).
+    Build a clear prompt for the model that:
+     - instructs it to use context (if available)
+     - includes web search results (if any)
+     - instructs it to include markdown links when require_links True
+    """
+    system_instruction = (
+        "You are a concise, helpful transport assistant. Use ONLY the facts from the provided context and web search results "
+        "to answer the user's question. Greet the user briefly, then give a direct, concise answer. If asked for links or sources, "
+        "return relevant results as clickable markdown links (e.g., [title](url)). Do not hallucinate links. If context or web results "
+        "do not contain enough information, say you don't know and suggest how to find it."
+    )
+
+    parts = [system_instruction, ""]
+
+    if context:
+        parts.append("CONTEXT:\n" + context + "\n")
+    if web_results:
+        parts.append("WebSearchResults:\n")
+        for i, r in enumerate(web_results, start=1):
+            # include simple numbered list that the model can reference
+            parts.append(f"{i}. {r.get('title','')}\n   URL: {r.get('href','')}\n   Snippet: {r.get('snippet','')}\n")
+        parts.append("")
+
+    # user question and formatting instructions
+    parts.append("---")
+    parts.append("User Question:\n" + question + "\n")
+    if require_links:
+        parts.append(
+            "Important: The user asked for links/sources. Provide a concise answer AND list the most relevant links as markdown bullets under a section titled 'Sources'. "
+            "Example:\nAnswer: <one paragraph>\n\nSources:\n- [Title 1](https://...)\n- [Title 2](https://...)\n\nOnly include links that appear in the WebSearchResults above; do NOT invent URLs."
+        )
+    else:
+        parts.append("Important: Do not provide external links unless the user explicitly asked for them.")
+    return "\n".join(parts)
+
+
+def generate_response(question: str, context: Optional[str]) -> Tuple[str, List[Dict[str, str]]]:
+    """
+    Generate an answer using GenAI. If user asked for links, perform a DuckDuckGo search and include results.
+    Returns: (answer_text, web_results_used)
     """
     global genai_client
     if genai_client is None:
-        return "Error: GenAI client not initialized. Set GOOGLE_API_KEY and call init_agent()."
+        return ("Error: GenAI client not initialized. Set GOOGLE_API_KEY and call init_agent().", [])
 
-    # System instruction + context + user question in a single prompt
-    system_prompt = (
-        "You are a concise, helpful transport-assistant. Use only facts from the provided context when answering. "
-        "Greet the user briefly and then answer the question. Be concise and relevant."
-    )
+    # Detect if the user asked for links/sources
+    require_links = is_link_request(question)
 
-    if context:
-        prompt = (
-            f"{system_prompt}\n\n"
-            f"Context:\n{context}\n\n"
-            f"---\nQuestion: {question}\n\n"
-            "Answer concisely using only the context above."
-        )
-    else:
-        prompt = (
-            "You are a transport-focused assistant. You cannot answer this question because the knowledge base is empty "
-            "or no relevant context was found. Politely inform the user you cannot answer and ask them to ask questions "
-            "related to transport services only.\n\n"
-            f"Question: {question}"
-        )
+    web_results = []
+    if require_links:
+        # run a web search, include top 5 results
+        web_results = search_web_duckduckgo(question, max_results=5)
+        if not web_results:
+            # if duckduckgo_search not installed or failed, warn the model (so GenAI won't hallucinate)
+            web_results = []
 
+    # If we have RAG context, include that too. If both web results & context present, model should use both.
+    prompt = _build_prompt(question, context, web_results if web_results else None, require_links)
+
+    # call the model
     try:
-        # The modern google-genai SDK exposes client.models.generate_content
-        resp = genai_client.models.generate_content(model=model, contents=prompt)
+        resp = genai_client.models.generate_content(model="gemini-2.5-pro", contents=prompt)
     except Exception as e:
-        # Try older style generate if available
+        # fallback older style or different sdk entrypoints
         try:
-            resp = genai.generate(model=model, messages=[{"role": "user", "content": prompt}])
+            # some SDK variants expose top-level generate
+            resp = genai.generate(model="models/gemini-2.5-pro", messages=[{"role": "user", "content": prompt}])
         except Exception as e2:
-            return f"[genai] Error calling model.generate_content: {e}; fallback error: {e2}"
+            return (f"[genai] Error calling model.generate_content: {e}; fallback error: {e2}", web_results)
 
-    # extract text robustly
     out_text = _extract_text_from_genai_response(resp)
-    return out_text
+
+    # If require_links is True, the model's output should include a 'Sources' section with markdown links.
+    return (out_text, web_results)
 
 
+# -------------------------
+# Quick manual test
+# -------------------------
 if __name__ == "__main__":
-    # quick manual test
     init_agent()
+    # Example 1: normal RAG question
     ctx = retrieve_context("What is the ticket booking workflow?")
-    print("CONTEXT:", ctx[:400], "...")
-    print("LLM answer:", generate_response("How to book a ticket?", ctx))
+    print("CONTEXT (truncated):", (ctx or "")[:400], "...\n")
+    ans, web = generate_response("How to book a ticket?", ctx)
+    print("Answer:\n", ans)
+    if web:
+        print("\nWeb results returned (not necessarily shown in answer):")
+        for r in web:
+            print("-", r.get("title"), r.get("href"))
+
+    # Example 2: user explicitly asks for links
+    q2 = "Where can I find documentation or guides about ticket booking integrations? Please provide links."
+    ctx2 = retrieve_context(q2)
+    ans2, web2 = generate_response(q2, ctx2)
+    print("\nQ2 Answer:\n", ans2)
+    if web2:
+        print("\nWeb results used:")
+        for r in web2:
+            print("-", r.get("title"), r.get("href"))

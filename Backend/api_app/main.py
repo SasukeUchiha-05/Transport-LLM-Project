@@ -115,13 +115,15 @@ async def receive_query(request: Request):
 
     print(f"Received query: {query}")
     context = retrieve_context(query)
-    answer = generate_response(query, context)
-    print(answer)
+    # generate_response returns (text, web_results_list)
+    answer_text, web_results = generate_response(query, context)
+    print(answer_text)
 
     chat = {
         "user": query,
         "context": context,
-        "chatbot": answer,
+        "chatbot": answer_text,
+        "web_results": web_results,
         "timestamp": datetime.datetime.now()
     }
 
@@ -131,7 +133,7 @@ async def receive_query(request: Request):
         {"$push": {"messages": chat}}
     )
 
-    return {"response": answer}
+    return {"response": answer_text}
 
 @app.post("/chats")
 async def get_chats_post(request: Request):

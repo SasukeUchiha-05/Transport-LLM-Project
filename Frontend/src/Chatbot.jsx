@@ -3,6 +3,8 @@ import axios from 'axios';
 import { Input, Button, Avatar, Switch } from '@material-tailwind/react';
 import './Chatbot.css'; // Ensure you import your CSS file
 import Loading from './Loading';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 const Chatbot = () => {
   const [sessionId, setSessionId] = useState(null);
@@ -170,7 +172,12 @@ const Chatbot = () => {
                       <Avatar src="https://img.freepik.com/free-vector/chatbot-chat-message-vectorart_78370-4104.jpg?size=338&ext=jpg&ga=GA1.1.2116175301.1719100800&semt=ais_user" alt="avatar" />
                       {/* <div className='px-1'></div> */}
                       <div className="bg-gray-200 text-gray-800 rounded-lg py-2 px-4 max-w-xl dark:bg-gray-900 dark:text-gray-100">
-                        <strong>Bot:</strong> {message.chatbot}
+                        <strong>Bot:</strong>
+                        <div className="markdown-body">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {message.chatbot}
+                          </ReactMarkdown>
+                        </div>
                       </div>
                     </div>
                   )}
